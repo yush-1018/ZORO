@@ -1,0 +1,649 @@
+﻿diff --git a/celery/app/defaults.py b/celery/app/defaults.py
+index 1ecbbb5aa..1015b8d16 100644
+--- a/celery/app/defaults.py
++++ b/celery/app/defaults.py
+@@ -321,6 +321,11 @@ NAMESPACES = Namespace(
+         store_errors_even_if_ignored=Option(False, type='bool'),
+         track_started=Option(False, type='bool'),
+         allow_error_cb_on_chord_header=Option(False, type='bool'),
++        circuit_breaker_threshold=Option(5, type='int'),
++        circuit_breaker_recovery_timeout=Option(30.0, type='float'),
++        circuit_breaker_half_open_max_calls=Option(1, type='int'),
++        circuit_breaker_failure_window=Option(60.0, type='float'),
++        circuit_breaker_exclude=Option(None, type='tuple'),
+     ),
+     worker=Namespace(
+         __old__=OLD_NS_WORKER,
+diff --git a/celery/app/task.py b/celery/app/task.py
+index ada306e6e..1ed29acf6 100644
+--- a/celery/app/task.py
++++ b/celery/app/task.py
+@@ -297,6 +297,13 @@ class Task:
+     #:
+     #: The application default can be overridden using the
+     #: :setting:`task_track_started` setting.
++    circuit_breaker = False
++    circuit_breaker_threshold = None
++    circuit_breaker_recovery_timeout = None
++    circuit_breaker_half_open_max_calls = None
++    circuit_breaker_failure_window = None
++    circuit_breaker_exclude = None
++
+     track_started = None
+ 
+     #: When enabled messages for this task will be acknowledged **after**
+diff --git a/celery/app/trace.py b/celery/app/trace.py
+index 4a47f98f1..3477ef441 100644
+--- a/celery/app/trace.py
++++ b/celery/app/trace.py
+@@ -20,7 +20,7 @@ from celery import current_app, group, signals, states
+ from celery._state import _task_stack
+ from celery.app.task import Context
+ from celery.app.task import Task as BaseTask
+-from celery.exceptions import BackendGetMetaError, Ignore, InvalidTaskError, Reject, Retry
++from celery.exceptions import BackendGetMetaError, CircuitBreakerError, Ignore, InvalidTaskError, Reject, Retry
+ from celery.result import AsyncResult
+ from celery.utils.log import get_logger
+ from celery.utils.nodenames import gethostname
+@@ -397,6 +397,46 @@ def build_tracer(name, task, loader=None, hostname=None, store_errors=True,
+     if task_has_custom(task, 'after_return'):
+         task_after_return = task.after_return
+ 
++    circuit_breaker_obj = None
++    if getattr(task, 'circuit_breaker', False):
++        from celery.utils.circuitbreaker import CircuitBreakerRegistry
++        if not hasattr(app, '_circuit_breaker_registry'):
++            app._circuit_breaker_registry = CircuitBreakerRegistry()
++        cb_threshold = (
++            task.circuit_breaker_threshold
++            if task.circuit_breaker_threshold is not None
++            else app.conf.task_circuit_breaker_threshold
++        )
++        cb_recovery_timeout = (
++            task.circuit_breaker_recovery_timeout
++            if task.circuit_breaker_recovery_timeout is not None
++            else app.conf.task_circuit_breaker_recovery_timeout
++        )
++        cb_half_open_max_calls = (
++            task.circuit_breaker_half_open_max_calls
++            if task.circuit_breaker_half_open_max_calls is not None
++            else app.conf.task_circuit_breaker_half_open_max_calls
++        )
++        cb_failure_window = (
++            task.circuit_breaker_failure_window
++            if task.circuit_breaker_failure_window is not None
++            else app.conf.task_circuit_breaker_failure_window
++        )
++        cb_exclude = (
++            task.circuit_breaker_exclude
++            if task.circuit_breaker_exclude is not None
++            else app.conf.task_circuit_breaker_exclude
++        )
++        circuit_breaker_obj = app._circuit_breaker_registry.get_or_create(
++            task_name=name,
++            threshold=cb_threshold,
++            recovery_timeout=cb_recovery_timeout,
++            half_open_max_calls=cb_half_open_max_calls,
++            failure_window=cb_failure_window,
++            exclude=cb_exclude,
++        )
++        circuit_breaker_obj.set_task_cls(task)
++
+     pid = os.getpid()
+ 
+     request_stack = task.request_stack
+@@ -415,6 +455,8 @@ def build_tracer(name, task, loader=None, hostname=None, store_errors=True,
+     signature = canvas.maybe_signature  # maybe_ does not clone if already
+ 
+     def on_error(request, exc, state=FAILURE, call_errbacks=True):
++        if circuit_breaker_obj is not None and state == FAILURE:
++            circuit_breaker_obj.record_failure(exc)
+         if propagate:
+             raise
+         I = Info(state, exc)
+@@ -579,11 +621,20 @@ def build_tracer(name, task, loader=None, hostname=None, store_errors=True,
+ 
+                 # -*- TRACE -*-
+                 try:
++                    if circuit_breaker_obj is not None:
++                        if not circuit_breaker_obj.can_execute():
++                            raise CircuitBreakerError(name)
++
+                     if task_before_start:
+                         task_before_start(uuid, args, kwargs)
+ 
+                     R = retval = fun(*args, **kwargs)
+                     state = SUCCESS
++                except CircuitBreakerError as exc:
++                    I, R = Info(REJECTED, exc), ExceptionInfo(internal=True)
++                    state, retval = I.state, I.retval
++                    I.handle_reject(task, task_request)
++                    traceback_clear(exc)
+                 except Reject as exc:
+                     I, R = Info(REJECTED, exc), ExceptionInfo(internal=True)
+                     state, retval = I.state, I.retval
+@@ -603,12 +654,16 @@ def build_tracer(name, task, loader=None, hostname=None, store_errors=True,
+                     traceback_clear(exc)
+                 except Exception as exc:
+                     I, R, state, retval = on_error(task_request, exc)
++                    if circuit_breaker_obj is not None and state == FAILURE:
++                        circuit_breaker_obj.record_failure(exc)
+                     # MEMORY LEAK FIX: Clear traceback frames to prevent memory retention (Issue #8882)
+                     traceback_clear(exc)
+                 except BaseException:
+                     raise
+                 else:
+                     try:
++                        if circuit_breaker_obj is not None:
++                            circuit_breaker_obj.record_success()
+                         # callback tasks must be applied before the result is
+                         # stored, so that result.children is populated.
+ 
+diff --git a/celery/exceptions.py b/celery/exceptions.py
+index 3203e9f49..f168a48e5 100644
+--- a/celery/exceptions.py
++++ b/celery/exceptions.py
+@@ -75,7 +75,7 @@ __all__ = (
+     'TaskPredicate', 'Ignore', 'Reject', 'Retry',
+ 
+     # Task related errors.
+-    'TaskError', 'QueueNotFound', 'IncompleteStream',
++    'TaskError', 'QueueNotFound', 'IncompleteStream', 'CircuitBreakerError',
+     'NotRegistered', 'AlreadyRegistered', 'TimeoutError',
+     'MaxRetriesExceededError', 'TaskRevokedError',
+     'InvalidTaskError', 'ChordError',
+@@ -310,3 +310,16 @@ class CeleryCommandException(ClickException):
+     def __init__(self, message, exit_code):
+         super().__init__(message=message)
+         self.exit_code = exit_code
++
++
++class CircuitBreakerError(TaskPredicate):
++
++    def __init__(self, task_name):
++        self.task_name = task_name
++        super().__init__(task_name)
++
++    def __str__(self):
++        return f'Circuit breaker open for task {self.task_name}'
++
++    def __reduce__(self):
++        return self.__class__, (self.task_name,)
+diff --git a/celery/signals.py b/celery/signals.py
+index 290fa2ba8..bf1c15704 100644
+--- a/celery/signals.py
++++ b/celery/signals.py
+@@ -24,7 +24,8 @@ __all__ = (
+     'after_setup_logger', 'after_setup_task_logger', 'beat_init',
+     'beat_embedded_init', 'heartbeat_sent', 'eventlet_pool_started',
+     'eventlet_pool_preshutdown', 'eventlet_pool_postshutdown',
+-    'eventlet_pool_apply',
++    'eventlet_pool_apply', 'circuit_breaker_opened', 'circuit_breaker_closed',
++    'circuit_breaker_half_opened',
+ )
+ 
+ # - Task
+@@ -147,6 +148,20 @@ eventlet_pool_apply = Signal(
+     providing_args={'target', 'args', 'kwargs'},
+ )
+ 
++# - Circuit Breaker
++circuit_breaker_opened = Signal(
++    name='circuit_breaker_opened',
++    providing_args={'task_name', 'failure_count'},
++)
++circuit_breaker_closed = Signal(
++    name='circuit_breaker_closed',
++    providing_args={'task_name'},
++)
++circuit_breaker_half_opened = Signal(
++    name='circuit_breaker_half_opened',
++    providing_args={'task_name'},
++)
++
+ # - Programs
+ user_preload_options = Signal(
+     name='user_preload_options',
+diff --git a/celery/utils/circuitbreaker.py b/celery/utils/circuitbreaker.py
+new file mode 100644
+index 000000000..e711a46b2
+--- /dev/null
++++ b/celery/utils/circuitbreaker.py
+@@ -0,0 +1,407 @@
++import threading
++from collections import deque
++from time import monotonic
++
++from celery import signals
++
++STATE_CLOSED = 'closed'
++STATE_OPEN = 'open'
++STATE_HALF_OPEN = 'half_open'
++
++_VALID_STATES = frozenset({STATE_CLOSED, STATE_OPEN, STATE_HALF_OPEN})
++
++
++class CircuitBreakerMetrics:
++
++    def __init__(self):
++        self._lock = threading.Lock()
++        self.total_calls = 0
++        self.successful_calls = 0
++        self.failed_calls = 0
++        self.rejected_calls = 0
++        self.trip_count = 0
++
++    def record_call(self):
++        with self._lock:
++            self.total_calls += 1
++
++    def record_success(self):
++        with self._lock:
++            self.successful_calls += 1
++
++    def record_failure(self):
++        with self._lock:
++            self.failed_calls += 1
++
++    def record_rejection(self):
++        with self._lock:
++            self.rejected_calls += 1
++
++    def record_trip(self):
++        with self._lock:
++            self.trip_count += 1
++
++    def error_rate(self):
++        with self._lock:
++            if self.total_calls == 0:
++                return 0.0
++            return (self.failed_calls / self.total_calls) * 100.0
++
++    def as_dict(self):
++        with self._lock:
++            return {
++                'total_calls': self.total_calls,
++                'successful_calls': self.successful_calls,
++                'failed_calls': self.failed_calls,
++                'rejected_calls': self.rejected_calls,
++                'trip_count': self.trip_count,
++                'error_rate_pct': (
++                    (self.failed_calls / self.total_calls * 100.0)
++                    if self.total_calls > 0 else 0.0
++                ),
++            }
++
++
++class CircuitBreakerListener:
++
++    def on_state_change(self, breaker, old_state, new_state):
++        pass
++
++    def on_failure(self, breaker, exc):
++        pass
++
++    def on_success(self, breaker):
++        pass
++
++
++class CircuitBreaker:
++
++    def __init__(self, task_name, threshold=5, recovery_timeout=30.0,
++                 half_open_max_calls=1, failure_window=60.0,
++                 exclude=None, clock=monotonic):
++        if not task_name:
++            raise ValueError('task_name must be a non-empty string')
++        if threshold < 1:
++            raise ValueError(
++                f'threshold must be >= 1, got {threshold}')
++        if recovery_timeout <= 0:
++            raise ValueError(
++                f'recovery_timeout must be > 0, got {recovery_timeout}')
++        if half_open_max_calls < 1:
++            raise ValueError(
++                f'half_open_max_calls must be >= 1, got {half_open_max_calls}')
++        if failure_window <= 0:
++            raise ValueError(
++                f'failure_window must be > 0, got {failure_window}')
++        self._task_name = task_name
++        self._threshold = threshold
++        self._recovery_timeout = recovery_timeout
++        self._half_open_max_calls = half_open_max_calls
++        self._failure_window = failure_window
++        self._exclude = tuple(exclude) if exclude else ()
++        self._clock = clock
++        self._lock = threading.Lock()
++        self._state = STATE_CLOSED
++        self._failure_timestamps = deque()
++        self._opened_at = None
++        self._half_open_call_count = 0
++        self._half_open_successes = 0
++        self._task_cls = None
++        self._listeners = []
++        self.metrics = CircuitBreakerMetrics()
++
++    def __repr__(self):
++        return (
++            f'<CircuitBreaker: {self._task_name} '
++            f'state={self._state} '
++            f'failures={len(self._failure_timestamps)}/{self._threshold}>'
++        )
++
++    @property
++    def task_name(self):
++        return self._task_name
++
++    @property
++    def state(self):
++        with self._lock:
++            self._check_state_transition()
++            return self._state
++
++    @property
++    def is_open(self):
++        return self.state == STATE_OPEN
++
++    @property
++    def is_closed(self):
++        return self.state == STATE_CLOSED
++
++    @property
++    def is_half_open(self):
++        return self.state == STATE_HALF_OPEN
++
++    @property
++    def failure_count(self):
++        with self._lock:
++            self._purge_old_failures(self._clock())
++            return len(self._failure_timestamps)
++
++    @property
++    def opened_at(self):
++        with self._lock:
++            return self._opened_at
++
++    def add_listener(self, listener):
++        if not isinstance(listener, CircuitBreakerListener):
++            raise TypeError('listener must be an instance of CircuitBreakerListener')
++        with self._lock:
++            if listener not in self._listeners:
++                self._listeners.append(listener)
++
++    def remove_listener(self, listener):
++        with self._lock:
++            if listener in self._listeners:
++                self._listeners.remove(listener)
++
++    def set_task_cls(self, task_cls):
++        self._task_cls = task_cls
++
++    def should_exclude(self, exc):
++        if not self._exclude:
++            return False
++        return isinstance(exc, self._exclude)
++
++    def can_execute(self):
++        with self._lock:
++            self.metrics.record_call()
++            self._check_state_transition()
++            if self._state == STATE_CLOSED:
++                return True
++            if self._state == STATE_OPEN:
++                self.metrics.record_rejection()
++                return False
++            if self._state == STATE_HALF_OPEN:
++                if self._half_open_call_count < self._half_open_max_calls:
++                    self._half_open_call_count += 1
++                    return True
++                self.metrics.record_rejection()
++                return False
++            return False
++
++    def record_failure(self, exc=None):
++        if exc is not None and self.should_exclude(exc):
++            return
++        with self._lock:
++            now = self._clock()
++            self.metrics.record_failure()
++            self._failure_timestamps.append(now)
++            self._purge_old_failures(now)
++            self._notify_listeners_failure(exc)
++            if self._state == STATE_HALF_OPEN:
++                self._transition_to_open(now)
++                return
++            if self._state == STATE_CLOSED:
++                if len(self._failure_timestamps) >= self._threshold:
++                    self._transition_to_open(now)
++
++    def record_success(self):
++        with self._lock:
++            self.metrics.record_success()
++            self._notify_listeners_success()
++            if self._state == STATE_HALF_OPEN:
++                self._half_open_successes += 1
++                if self._half_open_successes >= self._half_open_max_calls:
++                    self._transition_to_closed()
++
++    def reset(self):
++        with self._lock:
++            self._transition_to_closed()
++
++    def stats(self):
++        with self._lock:
++            self._check_state_transition()
++            self._purge_old_failures(self._clock())
++            m = self.metrics.as_dict()
++            return {
++                'state': self._state,
++                'failure_count': len(self._failure_timestamps),
++                'threshold': self._threshold,
++                'recovery_timeout': self._recovery_timeout,
++                'failure_window': self._failure_window,
++                'half_open_max_calls': self._half_open_max_calls,
++                'half_open_call_count': self._half_open_call_count,
++                'opened_at': self._opened_at,
++                'total_calls': m['total_calls'],
++                'successful_calls': m['successful_calls'],
++                'failed_calls': m['failed_calls'],
++                'rejected_calls': m['rejected_calls'],
++                'trip_count': m['trip_count'],
++                'error_rate_pct': m['error_rate_pct'],
++            }
++
++    def _check_state_transition(self):
++        if self._state == STATE_OPEN and self._opened_at is not None:
++            if self._clock() - self._opened_at >= self._recovery_timeout:
++                old_state = self._state
++                self._state = STATE_HALF_OPEN
++                self._half_open_call_count = 0
++                self._half_open_successes = 0
++                sender = self._task_cls or self._task_name
++                signals.circuit_breaker_half_opened.send(
++                    sender=sender, task_name=self._task_name)
++                self._notify_listeners_state_change(old_state, STATE_HALF_OPEN)
++
++    def _transition_to_open(self, now):
++        old_state = self._state
++        self._state = STATE_OPEN
++        self._opened_at = now
++        self._half_open_call_count = 0
++        self._half_open_successes = 0
++        self.metrics.record_trip()
++        failure_count = len(self._failure_timestamps)
++        sender = self._task_cls or self._task_name
++        signals.circuit_breaker_opened.send(
++            sender=sender, task_name=self._task_name,
++            failure_count=failure_count)
++        self._notify_listeners_state_change(old_state, STATE_OPEN)
++        task_cls = self._task_cls
++        if task_cls is not None and hasattr(task_cls, 'on_circuit_breaker_opened'):
++            try:
++                task_cls.on_circuit_breaker_opened(
++                    task_name=self._task_name,
++                    failure_count=failure_count,
++                )
++            except Exception:
++                pass
++
++    def _transition_to_closed(self):
++        old_state = self._state
++        self._state = STATE_CLOSED
++        self._failure_timestamps.clear()
++        self._opened_at = None
++        self._half_open_call_count = 0
++        self._half_open_successes = 0
++        sender = self._task_cls or self._task_name
++        signals.circuit_breaker_closed.send(
++            sender=sender, task_name=self._task_name)
++        self._notify_listeners_state_change(old_state, STATE_CLOSED)
++        task_cls = self._task_cls
++        if task_cls is not None and hasattr(task_cls, 'on_circuit_breaker_closed'):
++            try:
++                task_cls.on_circuit_breaker_closed(
++                    task_name=self._task_name,
++                )
++            except Exception:
++                pass
++
++    def _purge_old_failures(self, now):
++        cutoff = now - self._failure_window
++        while self._failure_timestamps and self._failure_timestamps[0] < cutoff:
++            self._failure_timestamps.popleft()
++
++    def _notify_listeners_state_change(self, old_state, new_state):
++        for listener in self._listeners:
++            try:
++                listener.on_state_change(self, old_state, new_state)
++            except Exception:
++                pass
++
++    def _notify_listeners_failure(self, exc):
++        for listener in self._listeners:
++            try:
++                listener.on_failure(self, exc)
++            except Exception:
++                pass
++
++    def _notify_listeners_success(self):
++        for listener in self._listeners:
++            try:
++                listener.on_success(self)
++            except Exception:
++                pass
++
++
++class CircuitBreakerRegistry:
++
++    def __init__(self):
++        self._breakers = {}
++        self._lock = threading.Lock()
++
++    def __repr__(self):
++        with self._lock:
++            return (
++                f'<CircuitBreakerRegistry: '
++                f'{len(self._breakers)} breaker(s) registered>'
++            )
++
++    def __len__(self):
++        with self._lock:
++            return len(self._breakers)
++
++    def __contains__(self, task_name):
++        with self._lock:
++            return task_name in self._breakers
++
++    def get_or_create(self, task_name, threshold=5, recovery_timeout=30.0,
++                      half_open_max_calls=1, failure_window=60.0,
++                      exclude=None, clock=monotonic):
++        with self._lock:
++            if task_name not in self._breakers:
++                self._breakers[task_name] = CircuitBreaker(
++                    task_name=task_name,
++                    threshold=threshold,
++                    recovery_timeout=recovery_timeout,
++                    half_open_max_calls=half_open_max_calls,
++                    failure_window=failure_window,
++                    exclude=exclude,
++                    clock=clock,
++                )
++            return self._breakers[task_name]
++
++    def get(self, task_name):
++        with self._lock:
++            return self._breakers.get(task_name)
++
++    def all_stats(self):
++        with self._lock:
++            return {
++                name: breaker.stats()
++                for name, breaker in self._breakers.items()
++            }
++
++    def summary(self):
++        with self._lock:
++            result = {
++                'total_breakers': len(self._breakers),
++                'open_breakers': [],
++                'half_open_breakers': [],
++                'closed_breakers': [],
++            }
++            for name, breaker in self._breakers.items():
++                st = breaker.state
++                if st == STATE_OPEN:
++                    result['open_breakers'].append(name)
++                elif st == STATE_HALF_OPEN:
++                    result['half_open_breakers'].append(name)
++                else:
++                    result['closed_breakers'].append(name)
++            return result
++
++    def reset(self, task_name):
++        with self._lock:
++            breaker = self._breakers.get(task_name)
++            if breaker is not None:
++                breaker.reset()
++                return True
++            return False
++
++    def reset_all(self):
++        with self._lock:
++            count = 0
++            for breaker in self._breakers.values():
++                breaker.reset()
++                count += 1
++            return count
++
++    def clear(self):
++        with self._lock:
++            self._breakers.clear()
+diff --git a/celery/worker/control.py b/celery/worker/control.py
+index 830fceaee..609504a88 100644
+--- a/celery/worker/control.py
++++ b/celery/worker/control.py
+@@ -635,3 +635,25 @@ def active_queues(state):
+         return [dict(queue.as_dict(recurse=True))
+                 for queue in state.consumer.task_consumer.queues]
+     return []
++
++
++
++@inspect_command()
++def circuit_breaker_stats(state, **kwargs):
++    registry = getattr(state.app, '_circuit_breaker_registry', None)
++    if registry is None:
++        return {}
++    return registry.all_stats()
++
++
++@control_command(
++    args=[('task_name', str)],
++    signature='<task_name>',
++)
++def circuit_breaker_reset(state, task_name, **kwargs):
++    registry = getattr(state.app, '_circuit_breaker_registry', None)
++    if registry is None:
++        return nok(f'no circuit breaker for {task_name}')
++    if registry.reset(task_name):
++        return ok(f'circuit breaker reset for {task_name}')
++    return nok(f'no circuit breaker for {task_name}')
