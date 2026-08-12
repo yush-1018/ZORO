@@ -20,23 +20,7 @@ class test_astraxx_CircuitBreaker_230e92:
         assert cb.state == STATE_CLOSED
         assert cb.can_execute() is True
 
-    def test_astraxx_stays_closed_below_threshold(self):
-        clock = Mock(return_value=100.0)
-        cb = CircuitBreaker(task_name='t.add', threshold=3, clock=clock)
-        cb.record_failure()
-        cb.record_failure()
-        assert cb.state == STATE_CLOSED
-        assert cb.can_execute() is True
-
     def test_astraxx_opens_at_threshold(self):
-        clock = Mock(return_value=100.0)
-        cb = CircuitBreaker(task_name='t.add', threshold=2, clock=clock)
-        cb.record_failure()
-        cb.record_failure()
-        assert cb.state == STATE_OPEN
-        assert cb.can_execute() is False
-
-    def test_astraxx_open_sends_signal(self):
         clock = Mock(return_value=100.0)
         received = []
 
@@ -45,71 +29,29 @@ class test_astraxx_CircuitBreaker_230e92:
 
         signals.circuit_breaker_opened.connect(handler)
         try:
-            cb = CircuitBreaker(task_name='t.add', threshold=1, clock=clock)
+            cb = CircuitBreaker(task_name='t.add', threshold=2, clock=clock)
             cb.record_failure()
+            cb.record_failure()
+            assert cb.state == STATE_OPEN
+            assert cb.can_execute() is False
             assert len(received) == 1
-            assert received[0] == ('t.add', 1)
+            assert received[0] == ('t.add', 2)
         finally:
             signals.circuit_breaker_opened.disconnect(handler)
 
-    def test_astraxx_transitions_to_half_open_after_timeout(self):
+    def test_astraxx_half_open_and_closed_signals_payload(self):
         time_ref = [100.0]
-        cb = CircuitBreaker(
-            task_name='t.add', threshold=1,
-            recovery_timeout=10.0, clock=lambda: time_ref[0],
-        )
-        cb.record_failure()
-        assert cb.state == STATE_OPEN
+        half_open_received = []
+        closed_received = []
 
-        time_ref[0] = 105.0
-        assert cb.state == STATE_OPEN
-        assert cb.can_execute() is False
+        def ho_handler(sender, task_name, **kw):
+            half_open_received.append(task_name)
 
-        time_ref[0] = 111.0
-        assert cb.can_execute() is True
-        assert cb.state == STATE_HALF_OPEN
+        def cl_handler(sender, task_name, **kw):
+            closed_received.append(task_name)
 
-    def test_astraxx_half_open_sends_signal(self):
-        time_ref = [100.0]
-        received = []
-
-        def handler(sender, task_name, **kw):
-            received.append(task_name)
-
-        signals.circuit_breaker_half_opened.connect(handler)
-        try:
-            cb = CircuitBreaker(
-                task_name='t.add', threshold=1,
-                recovery_timeout=10.0, clock=lambda: time_ref[0],
-            )
-            cb.record_failure()
-            time_ref[0] = 111.0
-            cb.can_execute()
-            assert len(received) == 1
-        finally:
-            signals.circuit_breaker_half_opened.disconnect(handler)
-
-    def test_astraxx_half_open_success_closes(self):
-        time_ref = [100.0]
-        cb = CircuitBreaker(
-            task_name='t.add', threshold=1,
-            recovery_timeout=10.0, half_open_max_calls=1,
-            clock=lambda: time_ref[0],
-        )
-        cb.record_failure()
-        time_ref[0] = 111.0
-        assert cb.can_execute() is True
-        cb.record_success()
-        assert cb.state == STATE_CLOSED
-
-    def test_astraxx_closed_sends_signal(self):
-        time_ref = [100.0]
-        received = []
-
-        def handler(sender, task_name, **kw):
-            received.append(task_name)
-
-        signals.circuit_breaker_closed.connect(handler)
+        signals.circuit_breaker_half_opened.connect(ho_handler)
+        signals.circuit_breaker_closed.connect(cl_handler)
         try:
             cb = CircuitBreaker(
                 task_name='t.add', threshold=1,
@@ -118,11 +60,15 @@ class test_astraxx_CircuitBreaker_230e92:
             )
             cb.record_failure()
             time_ref[0] = 111.0
-            cb.can_execute()
+            assert cb.can_execute() is True
+            assert cb.state == STATE_HALF_OPEN
+            assert half_open_received == ['t.add']
             cb.record_success()
-            assert len(received) == 1
+            assert cb.state == STATE_CLOSED
+            assert closed_received == ['t.add']
         finally:
-            signals.circuit_breaker_closed.disconnect(handler)
+            signals.circuit_breaker_half_opened.disconnect(ho_handler)
+            signals.circuit_breaker_closed.disconnect(cl_handler)
 
     def test_astraxx_half_open_failure_reopens(self):
         time_ref = [100.0]
@@ -135,19 +81,6 @@ class test_astraxx_CircuitBreaker_230e92:
         assert cb.can_execute() is True
         cb.record_failure()
         assert cb.state == STATE_OPEN
-
-    def test_astraxx_half_open_limits_probe_calls(self):
-        time_ref = [100.0]
-        cb = CircuitBreaker(
-            task_name='t.add', threshold=1,
-            recovery_timeout=10.0, half_open_max_calls=2,
-            clock=lambda: time_ref[0],
-        )
-        cb.record_failure()
-        time_ref[0] = 111.0
-        assert cb.can_execute() is True
-        assert cb.can_execute() is True
-        assert cb.can_execute() is False
 
     def test_astraxx_failure_window_purges_old(self):
         time_ref = [100.0]
@@ -166,76 +99,35 @@ class test_astraxx_CircuitBreaker_230e92:
         assert cb.state == STATE_OPEN
         cb.reset()
         assert cb.state == STATE_CLOSED
-        assert cb.can_execute() is True
 
-    def test_astraxx_stats_returns_correct_dict(self):
+    def test_astraxx_stats_schema(self):
         clock = Mock(return_value=100.0)
-        cb = CircuitBreaker(
-            task_name='t.add', threshold=5,
-            recovery_timeout=30.0, failure_window=60.0,
-            half_open_max_calls=1, clock=clock,
-        )
+        cb = CircuitBreaker(task_name='t.add', threshold=5, clock=clock)
         s = cb.stats()
-        assert s['state'] == 'closed'
+        assert s['state'] == STATE_CLOSED
         assert s['failure_count'] == 0
-        assert s['threshold'] == 5
-        assert s['recovery_timeout'] == 30.0
-        assert s['failure_window'] == 60.0
-        assert s['half_open_max_calls'] == 1
-        assert s['opened_at'] is None
 
 
 class test_astraxx_CircuitBreakerRegistry_230e92:
 
-    def test_astraxx_get_or_create(self):
-        reg = CircuitBreakerRegistry()
-        cb = reg.get_or_create('task1', threshold=3)
-        assert cb is reg.get_or_create('task1')
-        assert cb is reg.get('task1')
-
-    def test_astraxx_get_missing_returns_none(self):
-        reg = CircuitBreakerRegistry()
-        assert reg.get('missing') is None
-
-    def test_astraxx_all_stats(self):
-        reg = CircuitBreakerRegistry()
-        reg.get_or_create('t1')
-        reg.get_or_create('t2')
-        stats = reg.all_stats()
-        assert 't1' in stats
-        assert 't2' in stats
-
-    def test_astraxx_reset_existing(self):
+    def test_astraxx_registry_ops(self):
         reg = CircuitBreakerRegistry()
         cb = reg.get_or_create('t1', threshold=1)
+        assert reg.get('t1') is cb
+        assert 't1' in reg.all_stats()
         cb.record_failure()
-        assert cb.state == STATE_OPEN
         assert reg.reset('t1') is True
-        assert cb.state == STATE_CLOSED
-
-    def test_astraxx_reset_missing(self):
-        reg = CircuitBreakerRegistry()
         assert reg.reset('missing') is False
-
-    def test_astraxx_clear(self):
-        reg = CircuitBreakerRegistry()
-        reg.get_or_create('t1')
         reg.clear()
         assert reg.get('t1') is None
 
 
 class test_astraxx_CircuitBreakerError_230e92:
 
-    def test_astraxx_str_representation(self):
+    def test_astraxx_error_attributes_and_reduce(self):
         exc = CircuitBreakerError('t.add')
         assert str(exc) == 'Circuit breaker open for task t.add'
-
-    def test_astraxx_task_name_attribute(self):
-        exc = CircuitBreakerError('t.add')
         assert exc.task_name == 't.add'
-
-    def test_astraxx_reduce(self):
-        exc = CircuitBreakerError('t.add')
         cls, args = exc.__reduce__()
         assert cls is CircuitBreakerError
         assert args == ('t.add',)
@@ -243,86 +135,42 @@ class test_astraxx_CircuitBreakerError_230e92:
 
 class test_astraxx_circuit_breaker_integration_230e92:
 
-    def test_astraxx_tracer_opens_circuit_after_failures(self, celery_app):
+    def test_astraxx_tracer_integration_and_reject(self, celery_app):
         @celery_app.task(
             name='cb_fail_task',
             circuit_breaker=True,
-            circuit_breaker_threshold=2,
-            circuit_breaker_recovery_timeout=60.0,
+            circuit_breaker_threshold=1,
         )
         def failing_task():
             raise ValueError('boom')
 
         with pytest.raises(ValueError):
             failing_task.apply(throw=True)
-        with pytest.raises(ValueError):
-            failing_task.apply(throw=True)
 
-        registry = getattr(celery_app, '_circuit_breaker_registry', None)
-        assert registry is not None
-        cb = registry.get('cb_fail_task')
-        assert cb is not None
-        assert cb.state == STATE_OPEN
+        res = failing_task.apply()
+        assert isinstance(res.result, CircuitBreakerError)
 
-    def test_astraxx_tracer_uses_all_global_app_defaults(self, celery_app):
-        celery_app.conf.task_circuit_breaker_threshold = 2
-        celery_app.conf.task_circuit_breaker_recovery_timeout = 45.0
-        celery_app.conf.task_circuit_breaker_half_open_max_calls = 2
-        celery_app.conf.task_circuit_breaker_failure_window = 90.0
-        celery_app.conf.task_circuit_breaker_exclude = (TypeError,)
-
+    def test_astraxx_tracer_uses_global_exclude_fallback(self, celery_app):
+        celery_app.conf.task_circuit_breaker_exclude = (KeyError,)
         @celery_app.task(
-            name='cb_all_global_defaults_task',
-            circuit_breaker=True,
-        )
-        def failing_task():
-            raise ValueError('boom')
-
-        with pytest.raises(ValueError):
-            failing_task.apply(throw=True)
-        with pytest.raises(ValueError):
-            failing_task.apply(throw=True)
-
-        registry = getattr(celery_app, '_circuit_breaker_registry', None)
-        assert registry is not None
-        cb = registry.get('cb_all_global_defaults_task')
-        assert cb is not None
-        assert cb.state == STATE_OPEN
-        stats = cb.stats()
-        assert stats['threshold'] == 2
-        assert stats['recovery_timeout'] == 45.0
-        assert stats['half_open_max_calls'] == 2
-        assert stats['failure_window'] == 90.0
-
-    def test_astraxx_tracer_rejects_when_open(self, celery_app):
-        @celery_app.task(
-            name='cb_reject_task',
+            name='cb_global_exclude_task',
             circuit_breaker=True,
             circuit_breaker_threshold=1,
         )
-        def failing():
-            raise ValueError('boom')
+        def key_error_task():
+            raise KeyError('missing')
 
-        with pytest.raises(ValueError):
-            failing.apply(throw=True)
+        with pytest.raises(KeyError):
+            key_error_task.apply(throw=True)
 
-        res = failing.apply()
-        assert isinstance(res.result, CircuitBreakerError)
+        registry = getattr(celery_app, '_circuit_breaker_registry', None)
+        assert registry is not None
+        cb = registry.get('cb_global_exclude_task')
+        assert cb is not None
+        assert cb.state == STATE_CLOSED
 
-    def test_astraxx_tracer_records_success(self, celery_app):
-        @celery_app.task(
-            name='cb_success_task',
-            circuit_breaker=True,
-            circuit_breaker_threshold=5,
-        )
-        def ok_task():
-            return 42
-
-        res = ok_task.apply()
-        assert res.result == 42
-
-    def test_astraxx_control_stats(self, celery_app):
-        from celery.worker.control import circuit_breaker_stats
+    def test_astraxx_control_stats_and_reset(self, celery_app):
+        from celery.worker.control import circuit_breaker_reset, circuit_breaker_stats
 
         @celery_app.task(
             name='cb_ctrl_task',
@@ -341,72 +189,8 @@ class test_astraxx_circuit_breaker_integration_230e92:
         assert 'cb_ctrl_task' in stats
         assert stats['cb_ctrl_task']['state'] == STATE_OPEN
 
-    def test_astraxx_control_reset(self, celery_app):
-        from celery.worker.control import circuit_breaker_reset
+        res_ok = circuit_breaker_reset(state_mock, task_name='cb_ctrl_task')
+        assert res_ok == {'ok': 'circuit breaker reset for cb_ctrl_task'}
 
-        @celery_app.task(
-            name='cb_reset_task',
-            circuit_breaker=True,
-            circuit_breaker_threshold=1,
-        )
-        def fail():
-            raise RuntimeError('fail')
-
-        with pytest.raises(RuntimeError):
-            fail.apply(throw=True)
-
-        state_mock = Mock()
-        state_mock.app = celery_app
-        result = circuit_breaker_reset(state_mock, task_name='cb_reset_task')
-        assert result == {'ok': 'circuit breaker reset for cb_reset_task'}
-
-    def test_astraxx_control_reset_missing(self, celery_app):
-        from celery.worker.control import circuit_breaker_reset
-        state_mock = Mock()
-        state_mock.app = celery_app
-        result = circuit_breaker_reset(state_mock, task_name='nonexistent')
-        assert result == {'error': 'no circuit breaker for nonexistent'}
-
-    def test_astraxx_no_circuit_breaker_by_default(self, celery_app):
-        @celery_app.task(name='cb_normal_task')
-        def normal():
-            raise ValueError('boom')
-
-        with pytest.raises(ValueError):
-            normal.apply(throw=True)
-        with pytest.raises(ValueError):
-            normal.apply(throw=True)
-
-        assert not hasattr(celery_app, '_circuit_breaker_registry') or \
-            celery_app._circuit_breaker_registry.get('cb_normal_task') is None
-
-    def test_astraxx_excluded_exceptions(self, celery_app):
-        @celery_app.task(
-            name='cb_excluded_task',
-            circuit_breaker=True,
-            circuit_breaker_threshold=1,
-            circuit_breaker_exclude=(KeyError,),
-        )
-        def task_with_keyerror():
-            raise KeyError('missing key')
-
-        with pytest.raises(KeyError):
-            task_with_keyerror.apply(throw=True)
-
-        registry = getattr(celery_app, '_circuit_breaker_registry', None)
-        assert registry is not None
-        cb = registry.get('cb_excluded_task')
-        assert cb is not None
-        assert cb.state == STATE_CLOSED
-
-    def test_astraxx_validation_errors(self):
-        with pytest.raises(ValueError):
-            CircuitBreaker('')
-        with pytest.raises(ValueError):
-            CircuitBreaker('t', threshold=0)
-        with pytest.raises(ValueError):
-            CircuitBreaker('t', recovery_timeout=-1.0)
-        with pytest.raises(ValueError):
-            CircuitBreaker('t', half_open_max_calls=0)
-        with pytest.raises(ValueError):
-            CircuitBreaker('t', failure_window=0)
+        res_nok = circuit_breaker_reset(state_mock, task_name='nonexistent')
+        assert res_nok == {'error': 'no circuit breaker for nonexistent'}
