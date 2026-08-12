@@ -4,6 +4,7 @@ WORKDIR /app
 
 COPY . /app
 
-RUN pip install --no-cache-dir pytest==8.3.4 pytest-subtests==0.14.0 -e .
+RUN pip install --no-cache-dir -r requirements/default.txt pytest==8.3.4 pytest-subtests==0.14.0 && \
+    pip install --no-cache-dir --no-deps -e .
 
 CMD ["bash"]
