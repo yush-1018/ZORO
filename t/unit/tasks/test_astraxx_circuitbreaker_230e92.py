@@ -106,6 +106,21 @@ class test_astraxx_CircuitBreaker_230e92:
         s = cb.stats()
         assert s['state'] == STATE_CLOSED
         assert s['failure_count'] == 0
+        assert s['recovery_timeout'] == 60.0
+
+    def test_astraxx_single_success_closes_half_open_even_if_max_calls_higher(self):
+        time_ref = [100.0]
+        cb = CircuitBreaker(
+            task_name='t.add', threshold=1, recovery_timeout=10.0,
+            half_open_max_calls=5, clock=lambda: time_ref[0],
+        )
+        cb.record_failure()
+        assert cb.state == STATE_OPEN
+        time_ref[0] = 115.0
+        assert cb.can_execute() is True
+        assert cb.state == STATE_HALF_OPEN
+        cb.record_success()
+        assert cb.state == STATE_CLOSED
 
 
 class test_astraxx_CircuitBreakerRegistry_230e92:
@@ -194,3 +209,87 @@ class test_astraxx_circuit_breaker_integration_230e92:
 
         res_nok = circuit_breaker_reset(state_mock, task_name='nonexistent')
         assert res_nok == {'error': 'no circuit breaker for nonexistent'}
+
+
+class test_astraxx_CircuitBreakerDirectSignals_230e92:
+
+    def test_astraxx_direct_signals_payloads_and_idempotency(self):
+        time_ref = [100.0]
+        opened_events = []
+        closed_events = []
+        half_opened_events = []
+
+        def on_opened(sender, task_name, failure_count, **kw):
+            opened_events.append((sender, task_name, failure_count))
+
+        def on_closed(sender, task_name, **kw):
+            closed_events.append((sender, task_name))
+
+        def on_half_opened(sender, task_name, **kw):
+            half_opened_events.append((sender, task_name))
+
+        signals.circuit_breaker_opened.connect(on_opened)
+        signals.circuit_breaker_closed.connect(on_closed)
+        signals.circuit_breaker_half_opened.connect(on_half_opened)
+
+        try:
+            cb = CircuitBreaker(
+                task_name='t.direct', threshold=2, recovery_timeout=10.0,
+                half_open_max_calls=1, clock=lambda: time_ref[0],
+            )
+
+            # Initial reset while closed should NOT fire closed signal
+            cb.reset()
+            assert len(closed_events) == 0
+
+            # 1st failure - below threshold, no signal
+            cb.record_failure()
+            assert len(opened_events) == 0
+
+            # 2nd failure - hits threshold, transitions CLOSED -> OPEN
+            cb.record_failure()
+            assert len(opened_events) == 1
+            assert opened_events[0] == (None, 't.direct', 2)
+
+            # Subsequent failures while OPEN should NOT re-emit opened signal
+            cb.record_failure()
+            assert len(opened_events) == 1
+
+            # Advance time past recovery_timeout
+            time_ref[0] = 115.0
+
+            # Multiple calls to can_execute/state in HALF_OPEN should fire half_opened signal EXACTLY ONCE
+            assert cb.can_execute() is True
+            assert cb.state == STATE_HALF_OPEN
+            assert cb.can_execute() is False
+            assert len(half_opened_events) == 1
+            assert half_opened_events[0] == (None, 't.direct')
+
+            # Record success in HALF_OPEN -> transitions HALF_OPEN -> CLOSED
+            cb.record_success()
+            assert cb.state == STATE_CLOSED
+            assert len(closed_events) == 1
+            assert closed_events[0] == (None, 't.direct')
+
+            # Subsequent record_success/reset in CLOSED should NOT re-emit closed signal
+            cb.record_success()
+            cb.reset()
+            assert len(closed_events) == 1
+
+            # Trip to OPEN again
+            time_ref[0] = 120.0
+            cb.record_failure()
+            cb.record_failure()
+            assert len(opened_events) == 2
+
+            # Reset from OPEN -> CLOSED should fire closed signal ONCE
+            cb.reset()
+            assert cb.state == STATE_CLOSED
+            assert len(closed_events) == 2
+            assert closed_events[1] == (None, 't.direct')
+
+        finally:
+            signals.circuit_breaker_opened.disconnect(on_opened)
+            signals.circuit_breaker_closed.disconnect(on_closed)
+            signals.circuit_breaker_half_opened.disconnect(on_half_opened)
+

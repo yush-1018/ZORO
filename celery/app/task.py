@@ -297,6 +297,13 @@ class Task:
     #:
     #: The application default can be overridden using the
     #: :setting:`task_track_started` setting.
+    circuit_breaker = False
+    circuit_breaker_threshold = None
+    circuit_breaker_recovery_timeout = None
+    circuit_breaker_half_open_max_calls = None
+    circuit_breaker_failure_window = None
+    circuit_breaker_exclude = None
+
     track_started = None
 
     #: When enabled messages for this task will be acknowledged **after**

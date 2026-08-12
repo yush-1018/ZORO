@@ -24,7 +24,8 @@ __all__ = (
     'after_setup_logger', 'after_setup_task_logger', 'beat_init',
     'beat_embedded_init', 'heartbeat_sent', 'eventlet_pool_started',
     'eventlet_pool_preshutdown', 'eventlet_pool_postshutdown',
-    'eventlet_pool_apply',
+    'eventlet_pool_apply', 'circuit_breaker_opened', 'circuit_breaker_closed',
+    'circuit_breaker_half_opened',
 )
 
 # - Task
@@ -145,6 +146,20 @@ eventlet_pool_postshutdown = Signal(name='eventlet_pool_postshutdown')
 eventlet_pool_apply = Signal(
     name='eventlet_pool_apply',
     providing_args={'target', 'args', 'kwargs'},
+)
+
+# - Circuit Breaker
+circuit_breaker_opened = Signal(
+    name='circuit_breaker_opened',
+    providing_args={'task_name', 'failure_count'},
+)
+circuit_breaker_closed = Signal(
+    name='circuit_breaker_closed',
+    providing_args={'task_name'},
+)
+circuit_breaker_half_opened = Signal(
+    name='circuit_breaker_half_opened',
+    providing_args={'task_name'},
 )
 
 # - Programs

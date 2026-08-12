@@ -75,7 +75,7 @@ __all__ = (
     'TaskPredicate', 'Ignore', 'Reject', 'Retry',
 
     # Task related errors.
-    'TaskError', 'QueueNotFound', 'IncompleteStream',
+    'TaskError', 'QueueNotFound', 'IncompleteStream', 'CircuitBreakerError',
     'NotRegistered', 'AlreadyRegistered', 'TimeoutError',
     'MaxRetriesExceededError', 'TaskRevokedError',
     'InvalidTaskError', 'ChordError',
@@ -310,3 +310,16 @@ class CeleryCommandException(ClickException):
     def __init__(self, message, exit_code):
         super().__init__(message=message)
         self.exit_code = exit_code
+
+
+class CircuitBreakerError(TaskPredicate):
+
+    def __init__(self, task_name):
+        self.task_name = task_name
+        super().__init__(task_name)
+
+    def __str__(self):
+        return f'Circuit breaker open for task {self.task_name}'
+
+    def __reduce__(self):
+        return self.__class__, (self.task_name,)

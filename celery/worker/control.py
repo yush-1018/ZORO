@@ -635,3 +635,25 @@ def active_queues(state):
         return [dict(queue.as_dict(recurse=True))
                 for queue in state.consumer.task_consumer.queues]
     return []
+
+
+
+@inspect_command()
+def circuit_breaker_stats(state, **kwargs):
+    registry = getattr(state.app, '_circuit_breaker_registry', None)
+    if registry is None:
+        return {}
+    return registry.all_stats()
+
+
+@control_command(
+    args=[('task_name', str)],
+    signature='<task_name>',
+)
+def circuit_breaker_reset(state, task_name, **kwargs):
+    registry = getattr(state.app, '_circuit_breaker_registry', None)
+    if registry is None:
+        return nok(f'no circuit breaker for {task_name}')
+    if registry.reset(task_name):
+        return ok(f'circuit breaker reset for {task_name}')
+    return nok(f'no circuit breaker for {task_name}')

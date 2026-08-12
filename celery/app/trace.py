@@ -20,7 +20,7 @@ from celery import current_app, group, signals, states
 from celery._state import _task_stack
 from celery.app.task import Context
 from celery.app.task import Task as BaseTask
-from celery.exceptions import BackendGetMetaError, Ignore, InvalidTaskError, Reject, Retry
+from celery.exceptions import BackendGetMetaError, CircuitBreakerError, Ignore, InvalidTaskError, Reject, Retry
 from celery.result import AsyncResult
 from celery.utils.log import get_logger
 from celery.utils.nodenames import gethostname
@@ -397,6 +397,46 @@ def build_tracer(name, task, loader=None, hostname=None, store_errors=True,
     if task_has_custom(task, 'after_return'):
         task_after_return = task.after_return
 
+    circuit_breaker_obj = None
+    if getattr(task, 'circuit_breaker', False):
+        from celery.utils.circuitbreaker import CircuitBreakerRegistry
+        if not hasattr(app, '_circuit_breaker_registry'):
+            app._circuit_breaker_registry = CircuitBreakerRegistry()
+        cb_threshold = (
+            task.circuit_breaker_threshold
+            if task.circuit_breaker_threshold is not None
+            else app.conf.task_circuit_breaker_threshold
+        )
+        cb_recovery_timeout = (
+            task.circuit_breaker_recovery_timeout
+            if task.circuit_breaker_recovery_timeout is not None
+            else app.conf.task_circuit_breaker_recovery_timeout
+        )
+        cb_half_open_max_calls = (
+            task.circuit_breaker_half_open_max_calls
+            if task.circuit_breaker_half_open_max_calls is not None
+            else app.conf.task_circuit_breaker_half_open_max_calls
+        )
+        cb_failure_window = (
+            task.circuit_breaker_failure_window
+            if task.circuit_breaker_failure_window is not None
+            else app.conf.task_circuit_breaker_failure_window
+        )
+        cb_exclude = (
+            task.circuit_breaker_exclude
+            if task.circuit_breaker_exclude is not None
+            else app.conf.task_circuit_breaker_exclude
+        )
+        circuit_breaker_obj = app._circuit_breaker_registry.get_or_create(
+            task_name=name,
+            threshold=cb_threshold,
+            recovery_timeout=cb_recovery_timeout,
+            half_open_max_calls=cb_half_open_max_calls,
+            failure_window=cb_failure_window,
+            exclude=cb_exclude,
+        )
+        circuit_breaker_obj.set_task_cls(task)
+
     pid = os.getpid()
 
     request_stack = task.request_stack
@@ -415,6 +455,8 @@ def build_tracer(name, task, loader=None, hostname=None, store_errors=True,
     signature = canvas.maybe_signature  # maybe_ does not clone if already
 
     def on_error(request, exc, state=FAILURE, call_errbacks=True):
+        if circuit_breaker_obj is not None and state == FAILURE:
+            circuit_breaker_obj.record_failure(exc)
         if propagate:
             raise
         I = Info(state, exc)
@@ -579,11 +621,20 @@ def build_tracer(name, task, loader=None, hostname=None, store_errors=True,
 
                 # -*- TRACE -*-
                 try:
+                    if circuit_breaker_obj is not None:
+                        if not circuit_breaker_obj.can_execute():
+                            raise CircuitBreakerError(name)
+
                     if task_before_start:
                         task_before_start(uuid, args, kwargs)
 
                     R = retval = fun(*args, **kwargs)
                     state = SUCCESS
+                except CircuitBreakerError as exc:
+                    I, R = Info(REJECTED, exc), ExceptionInfo(internal=True)
+                    state, retval = I.state, I.retval
+                    I.handle_reject(task, task_request)
+                    traceback_clear(exc)
                 except Reject as exc:
                     I, R = Info(REJECTED, exc), ExceptionInfo(internal=True)
                     state, retval = I.state, I.retval
@@ -603,12 +654,16 @@ def build_tracer(name, task, loader=None, hostname=None, store_errors=True,
                     traceback_clear(exc)
                 except Exception as exc:
                     I, R, state, retval = on_error(task_request, exc)
+                    if circuit_breaker_obj is not None and state == FAILURE:
+                        circuit_breaker_obj.record_failure(exc)
                     # MEMORY LEAK FIX: Clear traceback frames to prevent memory retention (Issue #8882)
                     traceback_clear(exc)
                 except BaseException:
                     raise
                 else:
                     try:
+                        if circuit_breaker_obj is not None:
+                            circuit_breaker_obj.record_success()
                         # callback tasks must be applied before the result is
                         # stored, so that result.children is populated.
 

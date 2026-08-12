@@ -321,6 +321,11 @@ NAMESPACES = Namespace(
         store_errors_even_if_ignored=Option(False, type='bool'),
         track_started=Option(False, type='bool'),
         allow_error_cb_on_chord_header=Option(False, type='bool'),
+        circuit_breaker_threshold=Option(5, type='int'),
+        circuit_breaker_recovery_timeout=Option(60.0, type='float'),
+        circuit_breaker_half_open_max_calls=Option(1, type='int'),
+        circuit_breaker_failure_window=Option(60.0, type='float'),
+        circuit_breaker_exclude=Option(None, type='tuple'),
     ),
     worker=Namespace(
         __old__=OLD_NS_WORKER,
